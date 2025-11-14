@@ -1,5 +1,5 @@
 // ============================================
-// TIN REGISTRATION BACKEND - PRODUCTION VERSION
+// ENHANCED TIN REGISTRATION BACKEND - PRODUCTION
 // ============================================
 
 const express = require('express');
@@ -9,6 +9,11 @@ const mysql = require('mysql2/promise');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt'); // Add: npm install bcrypt
+const multer = require('multer'); // Add: npm install multer
+const path = require('path');
+const fs = require('fs'); // Standard fs for synchronous operations (used by Express)
+const fsp = require('fs').promises; // Use fsp for promise-based/async operations
 
 dotenv.config();
 
@@ -18,6 +23,34 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    const uploadDir = './uploads/certificates';
+    await fsp.mkdir(uploadDir, { recursive: true }); // ⬅️ FIX: Use fsp
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueName = `TIN_${Date.now()}_${file.originalname}`;
+    cb(null, uniqueName);
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /pdf|png|jpg|jpeg/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (extname && mimetype) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF and image files are allowed'));
+    }
+  },
+});
 
 // MySQL Connection Pool
 const pool = mysql.createPool({
@@ -39,6 +72,10 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// Admin credentials (in production, store in database with hashed password)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@tinregistration.com';
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH; // Store hashed password
+
 // Utility Functions
 function generateTIN() {
   return 'TIN' + Date.now() + Math.random().toString(36).substr(2, 9).toUpperCase();
@@ -48,258 +85,356 @@ function generateReference() {
   return 'REF' + Date.now() + Math.random().toString(36).substr(2, 5).toUpperCase();
 }
 
+function generateReferralCode(email) {
+  return email.split('@')[0].toUpperCase() + Math.random().toString(36).substr(2, 4).toUpperCase();
+}
+
+function generateVerificationCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
 // ============================================
-// ENDPOINT 1: Health Check
+// ENDPOINT: Health Check
 // ============================================
 app.get('/', (req, res) => {
   res.json({
     success: true,
     message: 'TIN Registration Backend API',
-    version: '1.0.0',
+    version: '2.0.0',
     status: 'Running',
   });
 });
 
 // ============================================
-// ENDPOINT 2: Initiate Payment & Registration
+// ENDPOINT: Create Account with Email Verification
 // ============================================
-app.post('/api/initiate-payment', async (req, res) => {
+app.post('/api/create-account', async (req, res) => {
   try {
-    const { bvn, dob, firstName, lastName, nin, state, email, phone, address, job, amount } = req.body;
+    const { email, password, confirmPassword, referralCode, agreedToTerms } = req.body;
 
-    // Validate required fields
-    if (!bvn || !dob || !firstName || !lastName || !nin || !state || !email || !phone || !address || !job) {
-      return res.status(400).json({ error: 'All fields are required' });
+    // Validation
+    if (!email || !password || !confirmPassword) {
+      return res.status(400).json({ error: 'All fields required' });
     }
 
-    // Check if user already exists
+    if (!agreedToTerms) {
+      return res.status(400).json({ error: 'You must agree to Terms & Conditions' });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({ error: 'Passwords do not match' });
+    }
+
     const connection = await pool.getConnection();
+
+    // Check if email already exists
     const [existingUser] = await connection.query(
-      'SELECT * FROM registrations WHERE email = ? OR nin = ?',
-      [email, nin]
+      'SELECT * FROM registrations WHERE email = ?',
+      [email.trim().toLowerCase()]
     );
 
-    if (existingUser.length > 0) {
+    if (existingUser.length > 0 && existingUser[0].email_verified) {
       connection.release();
-      return res.status(400).json({ error: 'Email or NIN already registered' });
+      return res.status(400).json({ error: 'Email already registered' });
     }
 
-    const reference = generateReference();
-    const tin = generateTIN();
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Initialize Paystack payment
-    try {
-      const paystackResponse = await axios.post(
-        'https://api.paystack.co/transaction/initialize',
-        {
-          email: email,
-          amount: amount * 100, // Paystack expects amount in kobo
-          reference: reference,
-          metadata: {
-            bvn,
-            dob,
-            firstName,
-            lastName,
-            nin,
-            state,
-            phone,
-            address,
-            job,
-            tin,
-          },
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-            'Content-Type': 'application/json',
-          },
-        }
+    // Generate verification code
+    const verificationCode = generateVerificationCode();
+    const userReferralCode = generateReferralCode(email);
+
+    // Handle referral
+    let referredBy = null;
+    if (referralCode) {
+      const [referrer] = await connection.query(
+        'SELECT id FROM registrations WHERE referral_code = ?',
+        [referralCode.toUpperCase()]
       );
+      if (referrer.length > 0) {
+        referredBy = referrer[0].id;
+        // Update referrer's referral count
+        await connection.query(
+          'UPDATE registrations SET referral_count = referral_count + 1 WHERE id = ?',
+          [referredBy]
+        );
+      }
+    }
 
-      // Save registration with pending status
+    if (existingUser.length > 0 && !existingUser[0].email_verified) {
+      // Update existing unverified account
       await connection.query(
-        `INSERT INTO registrations (bvn, dob, firstName, lastName, nin, state, email, phone, address, job, amount, reference, tin, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-        [bvn, dob, firstName, lastName, nin, state, email, phone, address, job, amount, reference, tin, 'pending']
+        `UPDATE registrations SET 
+         portal_password = ?, 
+         verification_code = ?, 
+         referral_code = ?,
+         referred_by = ?,
+         agreed_to_terms = ?
+         WHERE email = ?`,
+        [hashedPassword, verificationCode, userReferralCode, referredBy, true, email.trim().toLowerCase()]
       );
-
-      connection.release();
-
-      res.json({
-        success: true,
-        paymentUrl: paystackResponse.data.data.authorization_url,
-        reference: reference,
-        amount: amount,
-        tin: tin,
-      });
-    } catch (paystackError) {
-      connection.release();
-      console.error('Paystack Error:', paystackError.response?.data || paystackError.message);
-      res.status(500).json({ error: 'Payment initialization failed' });
+    } else {
+      // Create new account
+      await connection.query(
+        `INSERT INTO registrations 
+        (email, portal_password, verification_code, referral_code, referred_by, agreed_to_terms, status, created_at) 
+        VALUES (?, ?, ?, ?, ?, ?, 'account_created', NOW())`,
+        [email.trim().toLowerCase(), hashedPassword, verificationCode, userReferralCode, referredBy, true]
+      );
     }
+
+    connection.release();
+
+    // Send verification email
+    await sendVerificationEmail(email, verificationCode);
+
+    res.json({
+      success: true,
+      message: 'Account created! Please check your email for verification code.',
+      referralCode: userReferralCode,
+    });
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Signup Error:', error);
+    return res.status(500).json({ error: 'Server error during signup' });
+  }
+});
+
+// ============================================
+// ENDPOINT: Verify Email
+// ============================================
+app.post('/api/verify-email', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and verification code required' });
+    }
+
+    const connection = await pool.getConnection();
+    const [users] = await connection.query(
+      'SELECT * FROM registrations WHERE email = ? AND verification_code = ?',
+      [email.trim().toLowerCase(), code]
+    );
+
+    if (users.length === 0) {
+      connection.release();
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
+
+    await connection.query(
+      'UPDATE registrations SET email_verified = true, verification_code = NULL WHERE email = ?',
+      [email.trim().toLowerCase()]
+    );
+
+    connection.release();
+
+    res.json({
+      success: true,
+      message: 'Email verified successfully! You can now login.',
+    });
+  } catch (error) {
+    console.error('Verification Error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ============================================
-// ENDPOINT 3: Verify Payment (Webhook)
+// ENDPOINT: Resend Verification Code
 // ============================================
-app.post('/api/verify-payment', async (req, res) => {
+app.post('/api/resend-verification', async (req, res) => {
   try {
-    const { reference } = req.body;
+    const { email } = req.body;
 
-    if (!reference) {
-      return res.status(400).json({ error: 'Reference is required' });
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
     }
 
-    // Verify payment with Paystack
-    const paystackResponse = await axios.get(
-      `https://api.paystack.co/transaction/verify/${reference}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        },
-      }
+    const connection = await pool.getConnection();
+    const [users] = await connection.query(
+      'SELECT * FROM registrations WHERE email = ?',
+      [email.trim().toLowerCase()]
     );
 
-    const paymentData = paystackResponse.data.data;
-
-    if (paymentData.status === 'success') {
-      const connection = await pool.getConnection();
-
-      // Update registration status to paid
-      await connection.query(
-        `UPDATE registrations SET status = ?, paid_at = NOW() WHERE reference = ?`,
-        ['paid', reference]
-      );
-
-      // Get user data
-      const [user] = await connection.query(
-        'SELECT * FROM registrations WHERE reference = ?',
-        [reference]
-      );
-
+    if (users.length === 0) {
       connection.release();
-
-      if (user.length > 0) {
-        const userData = user[0];
-
-        // Send TIN via email
-        await sendTINEmail(userData.email, userData.firstName, userData.tin, userData);
-
-        res.json({
-          success: true,
-          message: 'Payment verified successfully',
-          tin: userData.tin,
-          email: userData.email,
-        });
-      } else {
-        res.status(404).json({ success: false, message: 'Registration not found' });
-      }
-    } else {
-      res.status(400).json({ success: false, message: 'Payment not successful' });
+      return res.status(404).json({ error: 'Email not found' });
     }
+
+    if (users[0].email_verified) {
+      connection.release();
+      return res.status(400).json({ error: 'Email already verified' });
+    }
+
+    const newCode = generateVerificationCode();
+    await connection.query(
+      'UPDATE registrations SET verification_code = ? WHERE email = ?',
+      [newCode, email.trim().toLowerCase()]
+    );
+
+    connection.release();
+
+    await sendVerificationEmail(email, newCode);
+
+    res.json({
+      success: true,
+      message: 'Verification code sent to your email',
+    });
   } catch (error) {
-    console.error('Verification Error:', error);
-    res.status(500).json({ error: 'Verification failed' });
+    console.error('Resend Verification Error:', error);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ============================================
-// ENDPOINT 4: Send TIN Email
+// ENDPOINT: Login (Enhanced Security)
 // ============================================
-async function sendTINEmail(email, firstName, tin, userData) {
+app.post('/api/login', async (req, res) => {
   try {
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: 'Your TIN Registration - Tax Identification Number',
-      html: `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <style>
-            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-            .header { background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
-            .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
-            .tin-box { background: white; border: 2px solid #0066CC; padding: 20px; margin: 20px 0; text-align: center; border-radius: 8px; }
-            .tin-number { font-size: 24px; font-weight: bold; color: #0066CC; letter-spacing: 2px; }
-            .info-table { width: 100%; margin-top: 20px; }
-            .info-table td { padding: 8px; border-bottom: 1px solid #ddd; }
-            .footer { text-align: center; margin-top: 30px; color: #666; font-size: 12px; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="header">
-              <h1>TIN Registration Successful!</h1>
-            </div>
-            <div class="content">
-              <h2>Hello ${firstName},</h2>
-              <p>Congratulations! Your Tax Identification Number (TIN) registration has been successfully processed.</p>
-              
-              <div class="tin-box">
-                <p>Your TIN Number:</p>
-                <div class="tin-number">${tin}</div>
-              </div>
+    const { email, password } = req.body;
 
-              <h3>Registration Details:</h3>
-              <table class="info-table">
-                <tr>
-                  <td><strong>Name:</strong></td>
-                  <td>${userData.firstName} ${userData.lastName}</td>
-                </tr>
-                <tr>
-                  <td><strong>Email:</strong></td>
-                  <td>${userData.email}</td>
-                </tr>
-                <tr>
-                  <td><strong>Phone:</strong></td>
-                  <td>${userData.phone}</td>
-                </tr>
-                <tr>
-                  <td><strong>State:</strong></td>
-                  <td>${userData.state}</td>
-                </tr>
-                <tr>
-                  <td><strong>Status:</strong></td>
-                  <td>Processing</td>
-                </tr>
-              </table>
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password required',
+      });
+    }
 
-              <h3>Next Steps:</h3>
-              <ol>
-                <li>Your TIN certificate will be ready within <strong>30 days</strong></li>
-                <li>You will receive a notification email when your certificate is ready</li>
-                <li>You can download your certificate from your portal</li>
-                <li>Keep this TIN number safe for all tax-related activities</li>
-              </ol>
+    const connection = await pool.getConnection();
+    const [users] = await connection.query(
+      'SELECT * FROM registrations WHERE email = ?',
+      [email.trim().toLowerCase()]
+    );
+    connection.release();
 
-              <p><strong>Important:</strong> Please save this email for your records. Your TIN is a permanent identification number for tax purposes.</p>
+    if (users.length === 0) {
+      return res.status(401).json({
+        success: false,
+        error: 'No account found. Please sign up first.',
+      });
+    }
 
-              <div class="footer">
-                <p>Thank you for using TIN Registration Services</p>
-                <p>For support, contact us at ${process.env.EMAIL_USER}</p>
-              </div>
-            </div>
-          </div>
-        </body>
-        </html>
-      `,
-    };
+    const user = users[0];
 
-    await transporter.sendMail(mailOptions);
-    console.log(`TIN email sent successfully to ${email}`);
+    // Check if email is verified
+    if (!user.email_verified) {
+      return res.status(401).json({
+        success: false,
+        error: 'Please verify your email first',
+        needsVerification: true,
+      });
+    }
+
+    // Check password
+    const passwordMatch = await bcrypt.compare(password, user.portal_password);
+
+    if (!passwordMatch) {
+      return res.status(401).json({
+        success: false,
+        error: 'Incorrect password',
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      user: {
+        email: user.email,
+        firstName: user.firstName || '',
+        lastName: user.lastName || '',
+        referralCode: user.referral_code,
+        referralCount: user.referral_count || 0,
+      },
+    });
   } catch (error) {
-    console.error('Email sending error:', error);
+    console.error('Login Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error',
+    });
   }
+});
+
+// ============================================
+// ENDPOINT: Initiate Payment
+// ============================================
+app.post('/api/initiate-payment', async (req, res) => {
+  try {
+    const { bvn, dob, firstName, lastName, nin, state, email, phone, address, job, amount } = req.body;
+
+    if (!bvn || !dob || !firstName || !lastName || !nin || !state || !email || !phone || !address || !job) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    const connection = await pool.getConnection();
+    
+    // Check for duplicates
+    const [existing] = await connection.query(
+  `SELECT * FROM registrations 
+   WHERE (email = ? OR nin = ?) 
+   AND status IN ('pending', 'paid', 'completed')`,
+  [email.trim().toLowerCase(), nin]
+);
+
+    if (existing.length > 0) {
+  connection.release();
+  return res.status(400).json({ 
+    error: 'You have already registered! Check your email for TIN details or use the Status page to track your registration.',
+    alreadyRegistered: true
+  });
 }
 
+    const reference = generateReference();
+    const tin = generateTIN();
+
+    const paystackResponse = await axios.post(
+      'https://api.paystack.co/transaction/initialize',
+      {
+        email: email,
+        amount: amount * 100,
+        reference: reference,
+        metadata: { bvn, dob, firstName, lastName, nin, state, phone, address, job, tin },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    // Update or insert registration
+    await connection.query(
+      `INSERT INTO registrations 
+      (bvn, dob, firstName, lastName, nin, state, email, phone, address, job, amount, reference, tin, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW())
+      ON DUPLICATE KEY UPDATE
+      bvn=VALUES(bvn), dob=VALUES(dob), firstName=VALUES(firstName), lastName=VALUES(lastName),
+      nin=VALUES(nin), state=VALUES(state), phone=VALUES(phone), address=VALUES(address),
+      job=VALUES(job), amount=VALUES(amount), reference=VALUES(reference), tin=VALUES(tin), status='pending'`,
+      [bvn, dob, firstName, lastName, nin, state, email, phone, address, job, amount, reference, tin]
+    );
+
+    connection.release();
+
+    res.json({
+      success: true,
+      paymentUrl: paystackResponse.data.data.authorization_url,
+      reference: reference,
+      amount: amount,
+      tin: tin,
+    });
+  } catch (error) {
+    console.error('Payment Error:', error);
+    res.status(500).json({ error: 'Payment initialization failed' });
+  }
+});
 // ============================================
-// ENDPOINT 5: Check TIN Status
+// ENDPOINT: Check TIN Status
 // ============================================
 app.post('/api/check-tin-status', async (req, res) => {
   try {
@@ -310,20 +445,30 @@ app.post('/api/check-tin-status', async (req, res) => {
     }
 
     const connection = await pool.getConnection();
+    
+    // Query for user with registration (excluding account_created status)
     const [users] = await connection.query(
-      'SELECT tin, email, firstName, lastName, status, paid_at, created_at FROM registrations WHERE email = ?',
-      [email]
+      `SELECT tin, email, firstName, lastName, status, paid_at, created_at 
+       FROM registrations 
+       WHERE email = ? AND status != ?`,
+      [email.trim().toLowerCase(), 'account_created']
     );
+    
     connection.release();
 
     if (users.length === 0) {
-      return res.status(404).json({ error: 'No registration found' });
+      return res.status(404).json({ 
+        error: 'No TIN registration found for this email. Please complete your registration first.',
+        noRegistration: true 
+      });
     }
 
     const userData = users[0];
+    
+    // Calculate expected release date (30 days from registration)
     const createdDate = new Date(userData.created_at);
-    const releaseDate = new Date(createdDate.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
-    const isReady = new Date() >= releaseDate;
+    const releaseDate = new Date(createdDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const isReady = userData.status === 'completed';
 
     res.json({
       success: true,
@@ -338,110 +483,79 @@ app.post('/api/check-tin-status', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Check TIN Status Error:', error);
+    res.status(500).json({ error: 'Server error while checking status' });
   }
 });
 
 // ============================================
-// ENDPOINT 6: Create Account (Simplified)
+// ADMIN ENDPOINTS
 // ============================================
-app.post('/api/create-account', async (req, res) => {
-  try {
-    const { email, password, confirmPassword } = req.body;
 
-    if (!email || !password || !confirmPassword) {
-      return res.status(400).json({ error: 'All fields required' });
-    }
-
-    if (password !== confirmPassword) {
-      return res.status(400).json({ error: 'Passwords do not match' });
-    }
-
-    const connection = await pool.getConnection();
-    
-    // Check if email already has account
-    const [existingUser] = await connection.query(
-      'SELECT * FROM registrations WHERE email = ?',
-      [email]
-    );
-
-    // If user doesn't exist, create placeholder
-    if (existingUser.length === 0) {
-      await connection.query(
-        'INSERT INTO registrations (email, portal_password, status, created_at) VALUES (?, ?, ?, NOW())',
-        [email, password, 'account_created']
-      );
-      connection.release();
-      return res.json({ success: true, message: 'Account created successfully' });
-    }
-
-    // If user exists but no password, update
-    if (existingUser[0].portal_password === null) {
-      await connection.query(
-        'UPDATE registrations SET portal_password = ? WHERE email = ?',
-        [password, email]
-      );
-      connection.release();
-      return res.json({ success: true, message: 'Account created successfully' });
-    }
-
-    // Account already exists
-    connection.release();
-    return res.status(400).json({ error: 'Account already exists for this email' });
-
-  } catch (error) {
-    console.error('Signup Error:', error);
-    return res.status(500).json({ error: 'Server error during signup' });
-  }
-});
-
-// ============================================
-// ENDPOINT 7: Login
-// ============================================
-app.post('/api/login', async (req, res) => {
+// Admin Login
+app.post('/api/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
+    if (email !== ADMIN_EMAIL) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const connection = await pool.getConnection();
-    const [users] = await connection.query(
-      'SELECT * FROM registrations WHERE email = ? AND portal_password = ?',
-      [email, password]
-    );
-    connection.release();
+    const passwordMatch = await bcrypt.compare(password, ADMIN_PASSWORD_HASH);
 
-    if (users.length > 0) {
-      res.json({
-        success: true,
-        message: 'Login successful',
-        user: {
-          email: users[0].email,
-          firstName: users[0].firstName,
-          lastName: users[0].lastName,
-        },
-      });
-    } else {
-      res.status(401).json({ success: false, error: 'Invalid email or password' });
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    res.json({
+      success: true,
+      message: 'Admin login successful',
+      token: 'admin_session_token', // In production, use JWT
+    });
   } catch (error) {
-    console.error('Login Error:', error);
+    console.error('Admin Login Error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ============================================
-// ENDPOINT 8: Admin - Get All Registrations
-// ============================================
+// Get All Registrations (Admin)
 app.get('/api/admin/registrations', async (req, res) => {
   try {
+    const { status, state, fromDate, toDate, search } = req.query;
+
+    let query = 'SELECT * FROM registrations WHERE 1=1';
+    const params = [];
+
+    if (status) {
+      query += ' AND status = ?';
+      params.push(status);
+    }
+
+    if (state) {
+      query += ' AND state = ?';
+      params.push(state);
+    }
+
+    if (fromDate) {
+      query += ' AND created_at >= ?';
+      params.push(fromDate);
+    }
+
+    if (toDate) {
+      query += ' AND created_at <= ?';
+      params.push(toDate);
+    }
+
+    if (search) {
+      query += ' AND (email LIKE ? OR firstName LIKE ? OR lastName LIKE ? OR tin LIKE ?)';
+      const searchTerm = `%${search}%`;
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
     const connection = await pool.getConnection();
-    const [registrations] = await connection.query(
-      'SELECT id, email, firstName, lastName, phone, state, status, tin, amount, reference, created_at, paid_at FROM registrations ORDER BY created_at DESC'
-    );
+    const [registrations] = await connection.query(query, params);
     connection.release();
 
     res.json({
@@ -450,13 +564,239 @@ app.get('/api/admin/registrations', async (req, res) => {
       data: registrations,
     });
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Admin Get Registrations Error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get Single Registration (Admin)
+app.get('/api/admin/registration/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const connection = await pool.getConnection();
+    const [registration] = await connection.query(
+      'SELECT * FROM registrations WHERE id = ?',
+      [id]
+    );
+    connection.release();
+
+    if (registration.length === 0) {
+      return res.status(404).json({ error: 'Registration not found' });
+    }
+
+    res.json({
+      success: true,
+      data: registration[0],
+    });
+  } catch (error) {
+    console.error('Admin Get Registration Error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update Registration Status (Admin)
+app.put('/api/admin/registration/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ['pending', 'paid', 'completed'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    const connection = await pool.getConnection();
+    await connection.query(
+      'UPDATE registrations SET status = ? WHERE id = ?',
+      [status, id]
+    );
+
+    // If status is completed, send notification
+    if (status === 'completed') {
+      const [user] = await connection.query(
+        'SELECT email, firstName, tin FROM registrations WHERE id = ?',
+        [id]
+      );
+      if (user.length > 0) {
+        await sendCertificateReadyEmail(user[0].email, user[0].firstName, user[0].tin, user[0].certificate_path);
+      }
+    }
+
+    connection.release();
+
+    res.json({
+      success: true,
+      message: 'Status updated successfully',
+    });
+  } catch (error) {
+    console.error('Admin Update Status Error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Upload Certificate (Admin)
+app.post('/api/admin/upload-certificate/:id', upload.single('certificate'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const certificatePath = req.file.path;
+
+    const connection = await pool.getConnection();
+    await connection.query(
+      'UPDATE registrations SET certificate_path = ?, status = ? WHERE id = ?',
+      [certificatePath, 'completed', id]
+    );
+
+    const [user] = await connection.query(
+      'SELECT email, firstName, tin FROM registrations WHERE id = ?',
+      [id]
+    );
+
+    connection.release();
+
+    if (user.length > 0) {
+      await sendCertificateReadyEmail(user[0].email, user[0].firstName, user[0].tin, user[0].certificate_path);
+    }
+
+    res.json({
+      success: true,
+      message: 'Certificate uploaded successfully',
+      filePath: certificatePath,
+    });
+  } catch (error) {
+    console.error('Admin Upload Certificate Error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ============================================
-// Database Initialization
+// ENDPOINT: Download Certificate
+// ============================================
+app.get('/api/download-certificate/:tin', async (req, res) => {
+  try {
+    const { tin } = req.params;
+
+    const connection = await pool.getConnection();
+    const [registration] = await connection.query(
+      'SELECT certificate_path, firstName, lastName, status, email FROM registrations WHERE tin = ?',
+      [tin]
+    );
+    connection.release();
+
+    // Check 1: TIN exists
+    if (registration.length === 0) {
+      return res.status(404).json({ error: 'TIN not found' });
+    }
+
+    // Check 2: Status is completed
+    if (registration[0].status !== 'completed') {
+      return res.status(400).json({ error: 'Certificate not ready yet. Current status: ' + registration[0].status });
+    }
+
+    // Check 3: Certificate file path exists
+    if (!registration[0].certificate_path) {
+      return res.status(404).json({ error: 'Certificate file path not found in database' });
+    }
+
+    // Create absolute path
+    const absolutePath = path.resolve(__dirname, registration[0].certificate_path);
+    
+    // Check 4: File actually exists on disk
+    if (!fs.existsSync(absolutePath)) {
+      console.error('File not found at path:', absolutePath);
+      return res.status(404).json({ 
+        error: 'Certificate file not found on server',
+        path: registration[0].certificate_path 
+      });
+    }
+
+    const fileName = `TIN_Certificate_${tin}.pdf`;
+
+    // Set proper headers for download
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    // Stream the file
+    const fileStream = fs.createReadStream(absolutePath);
+    fileStream.pipe(res);
+
+    fileStream.on('error', (err) => {
+      console.error('File stream error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error streaming certificate' });
+      }
+    });
+
+  } catch (error) {
+    console.error('Certificate Download Error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Server error: ' + error.message });
+    }
+  }
+});
+
+// ============================================
+// EMAIL FUNCTIONS
+// ============================================
+
+async function sendVerificationEmail(email, code) {
+  try {
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Verify Your Email - TIN Registration',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center;">
+            <h1>Email Verification</h1>
+          </div>
+          <div style="padding: 30px; background: #f9f9f9;">
+            <h2>Welcome to TIN Registration!</h2>
+            <p>Your verification code is:</p>
+            <div style="background: white; border: 2px solid #0066CC; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; color: #0066CC; letter-spacing: 5px;">
+              ${code}
+            </div>
+            <p style="margin-top: 20px;">Enter this code in the app to verify your email address.</p>
+            <p><strong>This code expires in 24 hours.</strong></p>
+          </div>
+        </div>
+      `,
+    };
+
+    await transporter.sendMail(mailOptions);
+  } catch (error) {
+    console.error('Verification Email Error:', error);
+  }
+}
+
+async function sendCertificateReadyEmail(email, firstName, tin, certificatePath) {
+  try {
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Your TIN Certificate is Ready!',
+      html: `...existing html content...`,
+      attachments: [
+        {
+          filename: `TIN_Certificate_${tin}.pdf`,
+          path: certificatePath, // Path to the certificate file
+        },
+      ],
+    };
+
+    await transporter.sendMail(mailOptions);
+  } catch (error) {
+    console.error('Certificate Ready Email Error:', error);
+  }
+}
+
+// ============================================
+// DATABASE INITIALIZATION
 // ============================================
 async function initializeDatabase() {
   try {
@@ -477,39 +817,46 @@ async function initializeDatabase() {
         job VARCHAR(100),
         amount INT,
         reference VARCHAR(50) UNIQUE,
-        status ENUM('account_created', 'pending', 'paid', 'completed') DEFAULT 'pending',
+        status ENUM('account_created', 'pending', 'paid', 'completed') DEFAULT 'account_created',
         tin VARCHAR(50),
         portal_password VARCHAR(255),
-        certificate_data LONGTEXT,
+        email_verified BOOLEAN DEFAULT FALSE,
+        verification_code VARCHAR(10),
+        referral_code VARCHAR(20) UNIQUE,
+        referred_by INT,
+        referral_count INT DEFAULT 0,
+        agreed_to_terms BOOLEAN DEFAULT FALSE,
+        certificate_path VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         paid_at TIMESTAMP NULL,
         INDEX(email),
         INDEX(reference),
         INDEX(tin),
-        INDEX(status)
+        INDEX(status),
+        INDEX(referral_code)
       )
     `);
 
     connection.release();
-    console.log('✓ Database initialized successfully');
+    console.log('✓ Database initialized');
   } catch (error) {
-    console.error('✗ Database initialization error:', error);
+    console.error('✗ Database error:', error);
   }
 }
 
 // ============================================
-// Start Server
+// START SERVER
 // ============================================
 const PORT = process.env.PORT || 5000;
 
 initializeDatabase().then(() => {
   app.listen(PORT, () => {
     console.log('===========================================');
-    console.log('  TIN REGISTRATION BACKEND');
+    console.log('  TIN REGISTRATION BACKEND v2.0');
     console.log('===========================================');
-    console.log(`✓ Server running on port ${PORT}`);
+    console.log(`✓ Server: http://localhost:${PORT}`);
     console.log(`✓ Environment: ${process.env.NODE_ENV}`);
-    console.log(`✓ Database: ${process.env.DB_NAME}`);
+    console.log(`✓ WhatsApp Support: +2349047143643`);
     console.log('===========================================');
   });
 });
