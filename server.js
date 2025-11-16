@@ -14,6 +14,8 @@ const multer = require('multer'); // Add: npm install multer
 const path = require('path');
 const fs = require('fs'); // Standard fs for synchronous operations (used by Express)
 const fsp = require('fs').promises; // Use fsp for promise-based/async operations
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'Legion_farternity1$';
 
 dotenv.config();
 
@@ -36,6 +38,35 @@ const storage = multer.diskStorage({
     cb(null, uniqueName);
   },
 });
+
+// Add this middleware function near the top of server.js (before your routes)
+
+const authenticateAdmin = (req, res, next) => {
+  // 1. Check for the token in the Authorization header
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Access Denied: Token Required' });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    // 2. Verify the token using the secret
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // 3. Ensure the token belongs to an admin (assuming your login endpoint sets isAdmin: true)
+    if (!decoded.isAdmin) {
+      return res.status(403).json({ message: 'Access Denied: Not Authorized' });
+    }
+
+    req.user = decoded; // Attach admin info to request
+    next(); // Proceed to the admin endpoint logic
+  } catch (err) {
+    // 4. Handle expired or invalid tokens
+    return res.status(401).json({ message: 'Access Denied: Invalid Token' });
+  }
+};
 
 const upload = multer({
   storage: storage,
@@ -65,11 +96,15 @@ const pool = mysql.createPool({
 
 // Email Configuration
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
-  },
+    // REMOVE: service: 'gmail',
+    host: 'smtp.gmail.com',  // Explicitly define the host
+    port: 465,               // Use the secure SSL port
+    secure: true,            // CRITICAL: Must be true for port 465
+
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASSWORD, // Your Google App Password
+    },
 });
 
 // Admin credentials (in production, store in database with hashed password)
@@ -433,6 +468,56 @@ app.post('/api/initiate-payment', async (req, res) => {
     res.status(500).json({ error: 'Payment initialization failed' });
   }
 });
+
+// Add this endpoint to server.js
+app.post('/api/paystack-webhook', async (req, res) => {
+  const secret = process.env.PAYSTACK_WEBHOOK_SECRET;
+  const hash = req.headers['x-paystack-signature'];
+  const event = req.body;
+  const transaction = event.data;
+
+  // 1. CRITICAL SECURITY CHECK: Verify the signature
+  const crypto = require('crypto');
+  const expectedHash = crypto.createHmac('sha512', secret).update(JSON.stringify(req.body)).digest('hex');
+
+  if (hash !== expectedHash) {
+    console.error('Webhook signature mismatch! Potentially unauthorized request.');
+    return res.status(401).send('Unauthorized');
+  }
+
+  // 2. Process the event
+  if (event.event === 'charge.success' && transaction.status === 'success') {
+    const transactionReference = transaction.reference;
+    const customerEmail = transaction.customer.email;
+
+    try {
+      // Find the registration using the reference stored during initiation
+      const [results] = await pool.query(
+        'SELECT id FROM registrations WHERE email = ? AND transaction_ref = ? AND status = ?',
+        [customerEmail, transactionReference, 'pending']
+      );
+
+      if (results.length > 0) {
+        // 3. Update status in the database
+        await pool.query(
+          'UPDATE registrations SET status = ? WHERE id = ?',
+          ['paid', results[0].id]
+        );
+        console.log(`Successfully updated status for ${customerEmail} to 'paid'.`);
+      } else {
+        console.warn(`Webhook received for a transaction not found or already processed: ${transactionReference}`);
+      }
+
+    } catch (error) {
+      console.error('Database update failed in webhook:', error);
+      // Respond 200 so Paystack doesn't keep sending the notification
+    }
+  }
+
+  // 4. IMPORTANT: Always return a 200 OK status to Paystack
+  res.status(200).send();
+});
+
 // ============================================
 // ENDPOINT: Check TIN Status
 // ============================================
@@ -519,7 +604,7 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 // Get All Registrations (Admin)
-app.get('/api/admin/registrations', async (req, res) => {
+app.get('/api/admin/registrations', authenticateAdmin, async (req, res) => {
   try {
     const { status, state, fromDate, toDate, search } = req.query;
 
@@ -596,7 +681,7 @@ app.get('/api/admin/registration/:id', async (req, res) => {
 });
 
 // Update Registration Status (Admin)
-app.put('/api/admin/registration/:id/status', async (req, res) => {
+app.put('/api/admin/registration/:id/status', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -636,7 +721,7 @@ app.put('/api/admin/registration/:id/status', async (req, res) => {
 });
 
 // Upload Certificate (Admin)
-app.post('/api/admin/upload-certificate/:id', upload.single('certificate'), async (req, res) => {
+app.post('/api/admin/upload-certificate/:id', authenticateAdmin, upload.single('certificate'), async (req, res) => {
   try {
     const { id } = req.params;
 
