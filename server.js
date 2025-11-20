@@ -4,6 +4,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const app = express();
 const dotenv = require('dotenv');
 const mysql = require('mysql2/promise');
 const axios = require('axios');
@@ -19,10 +20,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'Legion_farternity1$';
 
 dotenv.config();
 
-const app = express();
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: '*', // Allows connection from any source (emulator, browser, device)
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    preflightContinue: false,
+    optionsSuccessStatus: 204 // Successful handling of pre-flight OPTIONS request
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
