@@ -940,7 +940,7 @@ async function initializeDatabase() {
 const PORT = process.env.PORT || 3000;
 
 initializeDatabase().then(() => {
-  app.listen(PORT, () => {
+  app.listen(PORT, '::', () => { // <--- ADDED '::' HOST BINDING HERE
     console.log('===========================================');
     console.log('  TIN REGISTRATION BACKEND v2.0');
     console.log('===========================================');
