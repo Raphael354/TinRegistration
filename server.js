@@ -846,39 +846,52 @@ app.get('/api/download-certificate/:tin', async (req, res) => {
 // ============================================
 
 async function sendVerificationEmail(email, code) {
-  try {
-    const mailOptions = {
-      from: process.env.EMAIL_USER || EMAIL_USER,
-      to: email,
-      subject: 'Verify Your Email - TIN Registration',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center;">
-            <h1>Email Verification</h1>
-          </div>
-          <div style="padding: 30px; background: #f9f9f9;">
-            <h2>Welcome to TIN Registration!</h2>
-            <p>Your verification code is:</p>
-            <div style="background: white; border: 2px solid #0066CC; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; color: #0066CC; letter-spacing: 5px;">
-              ${code}
-            </div>
-            <p style="margin-top: 20px;">Enter this code in the app to verify your email address.</p>
-            <p><strong>This code expires in 24 hours.</strong></p>
-          </div>
+  const mailOptions = {
+    from: process.env.EMAIL_USER || EMAIL_USER,
+    to: email,
+    subject: 'Verify Your Email - TIN Registration',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center;">
+          <h1>Email Verification</h1>
         </div>
-      `,
-    };
+        <div style="padding: 30px; background: #f9f9f9;">
+          <h2>Welcome to TIN Registration!</h2>
+          <p>Your verification code is:</p>
+          <div style="background: white; border: 2px solid #0066CC; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; color: #0066CC; letter-spacing: 5px;">
+            ${code}
+          </div>
+          <p style="margin-top: 20px;">Enter this code in the app to verify your email address.</p>
+          <p><strong>This code expires in 24 hours.</strong></p>
+        </div>
+      </div>
+    `,
+  };
 
-    await transporter.sendMail(mailOptions);
-  } catch (error) {
-    console.error('Verification Email Error:', error);
+  // Retry loop for transient network/timeouts
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await transporter.sendMail(mailOptions);
+      if (attempt > 1) console.info(`Verification email sent after ${attempt} attempts to ${email}`);
+      return;
+    } catch (error) {
+      const code = error && error.code ? error.code : 'UNKNOWN';
+      console.error(`Verification Email Error (attempt ${attempt}) to ${email}:`, error && error.message ? error.message : error, 'code:', code);
+      if (attempt === maxAttempts) {
+        console.error('Verification Email final failure:', error);
+        return;
+      }
+      // Exponential backoff
+      await new Promise((res) => setTimeout(res, attempt * 2000));
+    }
   }
 }
 
 async function sendCertificateReadyEmail(email, firstName, tin, certificatePath) {
   try {
     const mailOptions = {
-      from: process.env.EMAIL_USER,
+      from: process.env.EMAIL_USER || EMAIL_USER,
       to: email,
       subject: 'Your TIN Certificate is Ready!',
       html: `...existing html content...`,
@@ -890,9 +903,25 @@ async function sendCertificateReadyEmail(email, firstName, tin, certificatePath)
       ],
     };
 
-    await transporter.sendMail(mailOptions);
+    // Retry logic like verification email
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await transporter.sendMail(mailOptions);
+        if (attempt > 1) console.info(`Certificate email sent after ${attempt} attempts to ${email}`);
+        return;
+      } catch (error) {
+        const code = error && error.code ? error.code : 'UNKNOWN';
+        console.error(`Certificate Ready Email Error (attempt ${attempt}) to ${email}:`, error && error.message ? error.message : error, 'code:', code);
+        if (attempt === maxAttempts) {
+          console.error('Certificate Ready Email final failure:', error);
+          return;
+        }
+        await new Promise((res) => setTimeout(res, attempt * 2000));
+      }
+    }
   } catch (error) {
-    console.error('Certificate Ready Email Error:', error);
+    console.error('Certificate Ready Email Unexpected Error:', error);
   }
 }
 
