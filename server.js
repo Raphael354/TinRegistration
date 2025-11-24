@@ -100,16 +100,27 @@ const pool = mysql.createPool({
 });
 
 // Email Configuration
-const transporter = nodemailer.createTransport({
-    // REMOVE: service: 'gmail',
-    host: 'smtp.gmail.com',  // Explicitly define the host
-    port: 465,               // Use the secure SSL port
-    secure: true,            // CRITICAL: Must be true for port 465
+// Make SMTP settings configurable via environment variables.
+const EMAIL_HOST = process.env.EMAIL_HOST || 'smtp.gmail.com';
+const EMAIL_PORT = parseInt(process.env.EMAIL_PORT || '465', 10);
+const EMAIL_SECURE = process.env.EMAIL_SECURE ? process.env.EMAIL_SECURE === 'true' : (EMAIL_PORT === 465);
+const EMAIL_USER = process.env.EMAIL_USER || 'kpairaphael@gmail.com';
+const EMAIL_PASS = process.env.EMAIL_PASS || 'dqfcntmbbqlsmzoe';
 
-    auth: {
-        user: "kpairaphael@gmail.com",
-        pass: "dqfcntmbbqlsmzoe", // Your Google App Password
-    },
+const transporter = nodemailer.createTransport({
+  host: EMAIL_HOST,
+  port: EMAIL_PORT,
+  secure: EMAIL_SECURE,
+  auth: {
+    user: EMAIL_USER,
+    pass: EMAIL_PASS,
+  },
+  // Helpful timeouts and debug options for diagnosing ETIMEDOUT issues
+  connectionTimeout: 30_000,
+  greetingTimeout: 30_000,
+  socketTimeout: 30_000,
+  logger: true,
+  debug: true,
 });
 
 // Admin credentials (in production, store in database with hashed password)
@@ -837,7 +848,7 @@ app.get('/api/download-certificate/:tin', async (req, res) => {
 async function sendVerificationEmail(email, code) {
   try {
     const mailOptions = {
-      from: process.env.EMAIL_USER,
+      from: process.env.EMAIL_USER || EMAIL_USER,
       to: email,
       subject: 'Verify Your Email - TIN Registration',
       html: `
