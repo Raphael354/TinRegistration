@@ -4,8 +4,6 @@
 
 const express = require('express');
 const cors = require('cors');
-const { Resend } = require('resend');
-const resend = new Resend(process.env.RESEND_API_KEY);
 const app = express();
 const dotenv = require('dotenv');
 const mysql = require('mysql2/promise');
