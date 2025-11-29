@@ -4,6 +4,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
 const app = express();
 const dotenv = require('dotenv');
 const mysql = require('mysql2/promise');
@@ -107,21 +109,7 @@ const EMAIL_SECURE = process.env.EMAIL_SECURE ? process.env.EMAIL_SECURE === 'tr
 const EMAIL_USER = process.env.EMAIL_USER || 'kpairaphael@gmail.com';
 const EMAIL_PASS = process.env.EMAIL_PASS || 'dqfcntmbbqlsmzoe';
 
-const transporter = nodemailer.createTransport({
-  host: EMAIL_HOST,
-  port: EMAIL_PORT,
-  secure: EMAIL_SECURE,
-  auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS,
-  },
-  // Helpful timeouts and debug options for diagnosing ETIMEDOUT issues
-  connectionTimeout: 30_000,
-  greetingTimeout: 30_000,
-  socketTimeout: 30_000,
-  logger: true,
-  debug: true,
-});
+
 
 // Admin credentials (in production, store in database with hashed password)
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@tinregistration.com';
@@ -846,84 +834,56 @@ app.get('/api/download-certificate/:tin', async (req, res) => {
 // ============================================
 
 async function sendVerificationEmail(email, code) {
-  const mailOptions = {
-    from: process.env.EMAIL_USER || EMAIL_USER,
-    to: email,
-    subject: 'Verify Your Email - TIN Registration',
-    html: `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <div style="background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center;">
-          <h1>Email Verification</h1>
-        </div>
-        <div style="padding: 30px; background: #f9f9f9;">
-          <h2>Welcome to TIN Registration!</h2>
-          <p>Your verification code is:</p>
-          <div style="background: white; border: 2px solid #0066CC; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; color: #0066CC; letter-spacing: 5px;">
-            ${code}
+  try {
+    await resend.emails.send({
+      from: 'TIN Registration <no-reply@tinregistration.com>',
+      to: email,
+      subject: 'Verify Your Email - TIN Registration',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center;">
+            <h1>Email Verification</h1>
           </div>
-          <p style="margin-top: 20px;">Enter this code in the app to verify your email address.</p>
-          <p><strong>This code expires in 24 hours.</strong></p>
+          <div style="padding: 30px; background: #f9f9f9;">
+            <h2>Welcome to TIN Registration!</h2>
+            <p>Your verification code is:</p>
+            <div style="background: white; border: 2px solid #0066CC; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; color: #0066CC; letter-spacing: 5px;">
+              ${code}
+            </div>
+            <p style="margin-top: 20px;">Enter this code in the app to verify your email address.</p>
+            <p><strong>This code expires in 24 hours.</strong></p>
+          </div>
         </div>
-      </div>
-    `,
-  };
+      `,
+    });
 
-  // Retry loop for transient network/timeouts
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      await transporter.sendMail(mailOptions);
-      if (attempt > 1) console.info(`Verification email sent after ${attempt} attempts to ${email}`);
-      return;
-    } catch (error) {
-      const code = error && error.code ? error.code : 'UNKNOWN';
-      console.error(`Verification Email Error (attempt ${attempt}) to ${email}:`, error && error.message ? error.message : error, 'code:', code);
-      if (attempt === maxAttempts) {
-        console.error('Verification Email final failure:', error);
-        return;
-      }
-      // Exponential backoff
-      await new Promise((res) => setTimeout(res, attempt * 2000));
-    }
+    console.log(`Verification email sent to ${email}`);
+  } catch (error) {
+    console.error("Resend Email Error:", error);
   }
 }
+
 
 async function sendCertificateReadyEmail(email, firstName, tin, certificatePath) {
   try {
-    const mailOptions = {
-      from: process.env.EMAIL_USER || EMAIL_USER,
+    await resend.emails.send({
+      from: 'TIN Registration <no-reply@tinregistration.com>',
       to: email,
       subject: 'Your TIN Certificate is Ready!',
-      html: `...existing html content...`,
-      attachments: [
-        {
-          filename: `TIN_Certificate_${tin}.pdf`,
-          path: certificatePath, // Path to the certificate file
-        },
-      ],
-    };
+      html: `
+        <h2>Hello ${firstName},</h2>
+        <p>Your TIN Certificate is now ready. Your TIN is:</p>
+        <h1>${tin}</h1>
+        <p>You can download your certificate directly from your dashboard.</p>
+      `
+    });
 
-    // Retry logic like verification email
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        await transporter.sendMail(mailOptions);
-        if (attempt > 1) console.info(`Certificate email sent after ${attempt} attempts to ${email}`);
-        return;
-      } catch (error) {
-        const code = error && error.code ? error.code : 'UNKNOWN';
-        console.error(`Certificate Ready Email Error (attempt ${attempt}) to ${email}:`, error && error.message ? error.message : error, 'code:', code);
-        if (attempt === maxAttempts) {
-          console.error('Certificate Ready Email final failure:', error);
-          return;
-        }
-        await new Promise((res) => setTimeout(res, attempt * 2000));
-      }
-    }
+    console.log(`Certificate email sent to ${email}`);
   } catch (error) {
-    console.error('Certificate Ready Email Unexpected Error:', error);
+    console.error("Certificate Email Error:", error);
   }
 }
+
 
 // ============================================
 // DATABASE INITIALIZATION
