@@ -10,7 +10,6 @@ const app = express();
 const dotenv = require('dotenv');
 const mysql = require('mysql2/promise');
 const axios = require('axios');
-const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt'); // Add: npm install bcrypt
 const multer = require('multer'); // Add: npm install multer
@@ -145,13 +144,12 @@ app.get('/', (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: Create Account with Email Verification
+// ENDPOINT: Create Account (NO Email Verification)
 // ============================================
 app.post('/api/create-account', async (req, res) => {
   try {
     const { email, password, confirmPassword, referralCode, agreedToTerms } = req.body;
 
-    // Validation
     if (!email || !password || !confirmPassword) {
       return res.status(400).json({ error: 'All fields required' });
     }
@@ -170,162 +168,38 @@ app.post('/api/create-account', async (req, res) => {
 
     const connection = await pool.getConnection();
 
-    // Check if email already exists
+    // Check if email exists
     const [existingUser] = await connection.query(
       'SELECT * FROM registrations WHERE email = ?',
       [email.trim().toLowerCase()]
     );
 
-    if (existingUser.length > 0 && existingUser[0].email_verified) {
+    if (existingUser.length > 0) {
       connection.release();
       return res.status(400).json({ error: 'Email already registered' });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
+    const referralCodeGenerated = generateReferralCode(email);
 
-    // Generate verification code
-    const verificationCode = generateVerificationCode();
-    const userReferralCode = generateReferralCode(email);
-
-    // Handle referral
-    let referredBy = null;
-    if (referralCode) {
-      const [referrer] = await connection.query(
-        'SELECT id FROM registrations WHERE referral_code = ?',
-        [referralCode.toUpperCase()]
-      );
-      if (referrer.length > 0) {
-        referredBy = referrer[0].id;
-        // Update referrer's referral count
-        await connection.query(
-          'UPDATE registrations SET referral_count = referral_count + 1 WHERE id = ?',
-          [referredBy]
-        );
-      }
-    }
-
-    if (existingUser.length > 0 && !existingUser[0].email_verified) {
-      // Update existing unverified account
-      await connection.query(
-        `UPDATE registrations SET 
-         portal_password = ?, 
-         verification_code = ?, 
-         referral_code = ?,
-         referred_by = ?,
-         agreed_to_terms = ?
-         WHERE email = ?`,
-        [hashedPassword, verificationCode, userReferralCode, referredBy, true, email.trim().toLowerCase()]
-      );
-    } else {
-      // Create new account
-      await connection.query(
-        `INSERT INTO registrations 
-        (email, portal_password, verification_code, referral_code, referred_by, agreed_to_terms, status, created_at) 
-        VALUES (?, ?, ?, ?, ?, ?, 'account_created', NOW())`,
-        [email.trim().toLowerCase(), hashedPassword, verificationCode, userReferralCode, referredBy, true]
-      );
-    }
+    // Create account fully verified
+    await connection.query(
+      `INSERT INTO registrations 
+      (email, portal_password, referral_code, email_verified, agreed_to_terms, status, created_at) 
+      VALUES (?, ?, ?, true, true, 'account_created', NOW())`,
+      [email.trim().toLowerCase(), hashedPassword, referralCodeGenerated]
+    );
 
     connection.release();
 
-    // Send verification email
-    await sendVerificationEmail(email, verificationCode);
-
     res.json({
       success: true,
-      message: 'Account created! Please check your email for verification code.',
-      referralCode: userReferralCode,
+      message: 'Account created successfully (No email verification required).',
+      referralCode: referralCodeGenerated,
     });
   } catch (error) {
     console.error('Signup Error:', error);
-    return res.status(500).json({ error: 'Server error during signup' });
-  }
-});
-
-// ============================================
-// ENDPOINT: Verify Email
-// ============================================
-app.post('/api/verify-email', async (req, res) => {
-  try {
-    const { email, code } = req.body;
-
-    if (!email || !code) {
-      return res.status(400).json({ error: 'Email and verification code required' });
-    }
-
-    const connection = await pool.getConnection();
-    const [users] = await connection.query(
-      'SELECT * FROM registrations WHERE email = ? AND verification_code = ?',
-      [email.trim().toLowerCase(), code]
-    );
-
-    if (users.length === 0) {
-      connection.release();
-      return res.status(400).json({ error: 'Invalid verification code' });
-    }
-
-    await connection.query(
-      'UPDATE registrations SET email_verified = true, verification_code = NULL WHERE email = ?',
-      [email.trim().toLowerCase()]
-    );
-
-    connection.release();
-
-    res.json({
-      success: true,
-      message: 'Email verified successfully! You can now login.',
-    });
-  } catch (error) {
-    console.error('Verification Error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ============================================
-// ENDPOINT: Resend Verification Code
-// ============================================
-app.post('/api/resend-verification', async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ error: 'Email required' });
-    }
-
-    const connection = await pool.getConnection();
-    const [users] = await connection.query(
-      'SELECT * FROM registrations WHERE email = ?',
-      [email.trim().toLowerCase()]
-    );
-
-    if (users.length === 0) {
-      connection.release();
-      return res.status(404).json({ error: 'Email not found' });
-    }
-
-    if (users[0].email_verified) {
-      connection.release();
-      return res.status(400).json({ error: 'Email already verified' });
-    }
-
-    const newCode = generateVerificationCode();
-    await connection.query(
-      'UPDATE registrations SET verification_code = ? WHERE email = ?',
-      [newCode, email.trim().toLowerCase()]
-    );
-
-    connection.release();
-
-    await sendVerificationEmail(email, newCode);
-
-    res.json({
-      success: true,
-      message: 'Verification code sent to your email',
-    });
-  } catch (error) {
-    console.error('Resend Verification Error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error during signup' });
   }
 });
 
@@ -360,13 +234,7 @@ app.post('/api/login', async (req, res) => {
     const user = users[0];
 
     // Check if email is verified
-    if (!user.email_verified) {
-      return res.status(401).json({
-        success: false,
-        error: 'Please verify your email first',
-        needsVerification: true,
-      });
-    }
+   // No email verification required
 
     // Check password
     const passwordMatch = await bcrypt.compare(password, user.portal_password);
@@ -833,35 +701,6 @@ app.get('/api/download-certificate/:tin', async (req, res) => {
 // EMAIL FUNCTIONS
 // ============================================
 
-async function sendVerificationEmail(email, code) {
-  try {
-    await resend.emails.send({
-      from: 'TIN Registration <no-reply@tinregistration.com>',
-      to: email,
-      subject: 'Verify Your Email - TIN Registration',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #0066CC, #0052A3); color: white; padding: 30px; text-align: center;">
-            <h1>Email Verification</h1>
-          </div>
-          <div style="padding: 30px; background: #f9f9f9;">
-            <h2>Welcome to TIN Registration!</h2>
-            <p>Your verification code is:</p>
-            <div style="background: white; border: 2px solid #0066CC; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; color: #0066CC; letter-spacing: 5px;">
-              ${code}
-            </div>
-            <p style="margin-top: 20px;">Enter this code in the app to verify your email address.</p>
-            <p><strong>This code expires in 24 hours.</strong></p>
-          </div>
-        </div>
-      `,
-    });
-
-    console.log(`Verification email sent to ${email}`);
-  } catch (error) {
-    console.error("Resend Email Error:", error);
-  }
-}
 
 
 async function sendCertificateReadyEmail(email, firstName, tin, certificatePath) {
